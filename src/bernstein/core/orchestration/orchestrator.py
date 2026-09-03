@@ -2356,11 +2356,45 @@ class Orchestrator:
                         exc,
                     )
 
+            # Bug (2026-09-03, Outerloop multi-node proof): everything above
+            # this point reads "open"/active_agents/"done"/"failed" - never
+            # "claimed". A task whose agent died (crash, or the
+            # stalled-manager/idle-log-age watchdog killing it) can sit at
+            # "claimed" forever: reap_dead_agents does not always run before
+            # this check in the same tick, and _release_stale_claims's own
+            # reclaim call (core.orchestration step 1b-i.5) only runs on the
+            # periodic `_run_normal` cadence, so it may not have run yet
+            # either. Left unchecked, the run below declares itself
+            # quiescent and fires generate_run_summary/notifies
+            # "run.completed" with that task silently excluded from both the
+            # done and failed counts - a caller reading
+            # tasks_completed/tasks_failed sees a clean "0 failed" while a
+            # task never reached a terminal state.
+            #
+            # Reclaim any claimed task right here, unconditional on
+            # `_run_normal` - `_release_stale_claims` already distinguishes a
+            # confirmed-dead agent (reclaimed immediately) from a live-but-
+            # slow one (only failed after its own stale_claim_timeout_s), so
+            # calling it early does not fail a task that may yet complete.
+            # If anything was reclaimed, the snapshot above is stale by
+            # definition, so defer the summary to next tick instead of
+            # trusting counts that do not yet reflect the reclaim.
+            _reclaimed_stale_claims = self._release_stale_claims(refreshed_tasks_by_status.get("claimed", []))
+            if _reclaimed_stale_claims:
+                logger.warning(
+                    "8b quiescence check (tick #%d): reclaimed %d claimed task(s) "
+                    "with a dead/stale agent just before run-summary generation - "
+                    "deferring the summary decision to the next tick so its "
+                    "refreshed counts include this reclaim",
+                    self._tick_count,
+                    _reclaimed_stale_claims,
+                )
+
             # Defect 29: refresh the drain tracker against the latest snapshot,
             # then log the run-end decision with all its inputs so a 2-minute
             # diagnosis from logs alone is possible (house rule 2).
             _pending_post_complete = self._refresh_drain_tracker(refreshed_tasks_by_status)
-            if _pending_post_complete > 0:
+            if _pending_post_complete > 0 or _reclaimed_stale_claims > 0:
                 _still_pending = sorted(
                     tid
                     for tid in self._post_complete_seen_task_ids

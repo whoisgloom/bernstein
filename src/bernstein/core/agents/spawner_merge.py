@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import subprocess
 import threading
 import time
@@ -175,6 +176,138 @@ def _incoming_change(worktree_root: Path, branch: str) -> tuple[list[str], str]:
         msg = f"could not be read: git diff {spec} exited {body.returncode} ({_sanitise_for_log(body.stderr.strip())})"
         raise IncomingChangeUnreadable(msg)
     return files, body.stdout
+
+
+# ---------------------------------------------------------------------------
+# WIP/dump refusal (Bug: 2026-09-03, Outerloop multi-node proof)
+# ---------------------------------------------------------------------------
+#
+# ``_save_partial_work`` (agent_lifecycle.py) stages the whole worktree with
+# ``git add -A`` and commits it as ``[WIP] <session-id> partial work`` on a
+# timeout kill or crash, then merges that branch through this exact path so
+# the crashed agent's work is not lost. That is the right call for a worktree
+# that genuinely holds finished, reviewable work an agent simply failed to
+# commit properly -- but observed twice in real end-to-end runs, the
+# unconditional ``git add -A`` also swept up the worktree's own scratch state
+# (``.env``, ``uv.lock``, ``.sdd/`` tool-internal metadata, ``__pycache__``
+# binaries -- hundreds of files, tens of thousands of lines) and merged it
+# onto the delivery branch under that WIP-marker commit, while the run's own
+# ``bernstein status`` still reported "0 failed". A caller downstream of the
+# merge (a PR generator, a delivery pipeline) has no signal that what just
+# landed is unfinished, unreviewed, worktree-local scratch state rather than
+# the task's actual output.
+#
+# This refuses that specific shape at the one place every merge (the normal
+# success path AND the crash/timeout salvage path) already passes through,
+# rather than trying to special-case the salvage caller. A refusal here still
+# leaves the branch intact (``_refuse_merge`` never deletes anything) -- an
+# operator can inspect and cherry-pick the real change out of it by hand,
+# same guarantee the other gates in this module already give.
+_WIP_MARKER_RE = re.compile(r"^\s*(?:\[wip\]|wip\b)", re.IGNORECASE)
+
+# Paths that are worktree-local scratch state, never a task's real output.
+# Narrow and denylist-shaped on purpose -- these are exactly the paths a real
+# incident showed landing in a merge, not a general "looks suspicious" guess.
+_FORBIDDEN_MERGE_PATH_RE = re.compile(
+    r"""
+    (?:^|/)\.env(?:\.[^/]+)?$          # .env, .env.local, ...
+    | (?:^|/)__pycache__/              # compiled bytecode caches
+    | \.pyc$
+    | (?:^|/)uv\.lock$                 # lockfiles: worktree-local resolution,
+    | (?:^|/)package-lock\.json$       # not the task's actual code change
+    | (?:^|/)poetry\.lock$
+    | (?:^|/)Cargo\.lock$
+    | (?:^|/)\.sdd/(?:runtime|memory|caching|lineage)/  # bernstein's own
+                                        # tool-internal run/session state
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _tip_commit_subject(worktree_root: Path, branch: str) -> str | None:
+    """Return ``branch``'s tip commit subject, or ``None`` if unreadable.
+
+    Best-effort: an unreadable subject must not itself block a merge the
+    other gates already judged safe -- it falls through to "no marker seen",
+    the same as a branch whose subject genuinely carries no WIP marker.
+    """
+    from bernstein.core.git.git_basic import run_git as _run_git
+
+    try:
+        result = _run_git(["log", "-1", "--format=%s", branch], worktree_root, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _partial_work_refusal(
+    session: AgentSession,
+    worktree_root: Path,
+    branch: str,
+) -> MergeResult | None:
+    """Refuse a merge whose tip commit or diff is worktree-scratch-shaped.
+
+    Returns ``None`` when the merge may proceed. Two independent checks,
+    either one refusing: the branch's tip commit subject carries a WIP
+    marker (``_save_partial_work``'s own signature), or the incoming diff
+    touches a path that is never a task's real output (env files,
+    lockfiles, caches, bernstein's own tool-internal state).
+
+    An unreadable tip subject does not refuse by itself (see
+    :func:`_tip_commit_subject`) -- only the file-list check below can refuse
+    on an unreadable read, matching the other gates in this module, which
+    already treat "the change could not be read" as itself a refusal reason
+    rather than silently admitting it.
+    """
+    subject = _tip_commit_subject(worktree_root, branch)
+    if subject is not None and _WIP_MARKER_RE.match(subject):
+        return _refuse_merge(
+            session,
+            worktree_root,
+            branch,
+            reason=(
+                f"refused: {branch!r}'s tip commit ({subject!r}) carries a WIP "
+                "marker -- this is the signature _save_partial_work leaves on a "
+                "crash/timeout salvage commit, not a task's real output"
+            ),
+            code="wip-marker-commit",
+        )
+
+    try:
+        files = _incoming_files(worktree_root, branch)
+    except IncomingChangeUnreadable as exc:
+        # Fail OPEN here, unlike the opt-in gates below (blast-radius,
+        # file-scope) that refuse on an unreadable diff. Those are gates an
+        # operator explicitly asked for, so a read failure there means their
+        # requested check could not run and the safest answer is to refuse.
+        # This gate is unconditional and runs on every merge; a diff that
+        # cannot be read is not evidence of the WIP/dump shape this gate
+        # looks for, and a blanket refuse-on-unreadable here would block
+        # merges for reasons that have nothing to do with partial work
+        # (e.g. a branch with nothing to diff against yet). The commit-
+        # subject check above already fails open the same way.
+        logger.debug(
+            "partial-work gate: diff for %r unreadable (%s), skipping the path check",
+            branch,
+            exc,
+        )
+        return None
+    forbidden = [f for f in files if _FORBIDDEN_MERGE_PATH_RE.search(f)]
+    if forbidden:
+        return _refuse_merge(
+            session,
+            worktree_root,
+            branch,
+            reason=(
+                f"refused: the merge would bring in worktree-scratch path(s) "
+                f"{', '.join(forbidden)} -- never a task's real output"
+            ),
+            code="partial-work-forbidden-paths",
+        )
+
+    return None
 
 
 def _blast_radius_refusal(
@@ -578,6 +711,15 @@ def _run_merge_and_push(
                 f"default branch; set {ENV_ALLOW_MERGE_TO_DEFAULT_BRANCH}=1 to override"
             ),
         )
+
+    # Partial-work/dump gate: unconditional, unlike the quality gate below --
+    # a WIP-marker commit or a worktree-scratch path in the diff is never a
+    # legitimate merge regardless of whether the operator opted into quality
+    # gates for this project. See the gate's own docstring for the incident
+    # this exists for.
+    partial_work_refusal = _partial_work_refusal(session, worktree_root, f"agent/{session.id}")
+    if partial_work_refusal is not None:
+        return partial_work_refusal
 
     # Reversibility gate (#1322): an operator who set ``--max-blast-radius``
     # gets the ceiling evaluated here, on the change this merge would land.
