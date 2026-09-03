@@ -91,6 +91,21 @@ _XL_ROLES = frozenset({"architect", "security", "manager"})
 _CLAIM_CONFLICT_MAX_ATTEMPTS = 5  # hard cap on re-fetch+retry attempts within one episode
 _CLAIM_CONFLICT_BACKOFF_BASE_S = 5.0  # first cross-tick backoff after an exhausted episode
 _CLAIM_CONFLICT_BACKOFF_MAX_S = 300.0  # cap so a permanently-stuck task backs off at most 5 min
+# Statuses a task cannot be mid-flight in: a watcher's stale-snapshot destroy
+# must never fire against one of these (completion-race guard, 2026-09-03).
+# PENDING_APPROVAL is included: a completion passed the post-execution sign-off
+# hand-off, which is a success the watcher has no business overriding.
+_TERMINAL_OR_RESOLVED_TASK_STATUSES = frozenset(
+    {
+        TaskStatus.DONE,
+        TaskStatus.CLOSED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.ABANDONED,
+        TaskStatus.REFUSED,
+        TaskStatus.PENDING_APPROVAL,
+    }
+)
 _CLAIM_TERMINAL_STATUSES = frozenset(
     {
         TaskStatus.DONE,
@@ -1162,6 +1177,56 @@ def retry_or_fail_task(
         except httpx.HTTPError as exc:
             logger.error("retry_or_fail_task: could not fetch task %s: %s", task_id, exc)
             return
+
+    # Completion-race guard (2026-09-03, Outerloop attempt-3): the crash/timeout
+    # watchers decide from a tick-start tasks_snapshot, and a slow final LLM turn
+    # (local models routinely exceed the staleness window) can land the agent's
+    # own /tasks/{id}/complete POST between that snapshot and this call. Failing
+    # from a stale mid-flight status then destroys a real success: DONE -> FAILED
+    # is a legal transition (janitor reopen edge), so the server accepts it and
+    # a retry task fans out work that already finished. Terminal snapshot states
+    # (done/failed/cancelled/refused) need no re-check -- the snapshot itself is
+    # the terminal verdict and callers rely on this path to tidy them up. Only
+    # mid-flight statuses (open/claimed/in_progress/orphaned/blocked/...) are
+    # raced by a concurrent completion, so only those pay the one live GET.
+    # getattr-defensive: legacy ad-hoc callers and duck-typed test doubles may
+    # carry no status at all; those keep the historical unguarded behavior.
+    _snapshot_status = getattr(task, "status", None)
+    if _snapshot_status is not None and _snapshot_status not in _TERMINAL_OR_RESOLVED_TASK_STATUSES:
+        try:
+            resp = client.get(f"{base}/tasks/{task_id}")
+            resp.raise_for_status()
+            live_task = Task.from_dict(resp.json())
+        except httpx.HTTPError as exc:
+            # Unreachable server: keep the historical behavior (retry/fail from
+            # the snapshot) -- a fail here may hit a resurrected task, but the
+            # server's IllegalTransitionError on a truly terminal state is a
+            # 409 the caller already tolerates. Never lose the retry because a
+            # status probe failed.
+            logger.warning(
+                "retry_or_fail_task: live status probe for %s failed (%s); proceeding on snapshot status %s",
+                task_id,
+                exc,
+                _snapshot_status.value,
+            )
+        else:
+            if live_task.status not in (
+                TaskStatus.OPEN,
+                TaskStatus.CLAIMED,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.ORPHANED,
+            ):
+                logger.warning(
+                    "completion_race_guard: task=%s skipped retry/fail -- snapshot said %s but the "
+                    "live status is now %s (the agent's completion landed after this watcher's "
+                    "snapshot was taken); watcher reason=%r. The task's own terminal state stands.",
+                    task_id,
+                    _snapshot_status.value,
+                    live_task.status.value,
+                    reason,
+                )
+                return
+            task = live_task
 
     # Dedup: prevent retry fan-out (same task retried multiple times)
     if task_id in retried_task_ids:
