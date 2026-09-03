@@ -143,7 +143,13 @@ class QwenAdapter(CLIAdapter):
         # Map abstract/alias names to real Qwen API model IDs.
         # Always pass --model explicitly to avoid relying on settings.json.
         resolved = self._MODEL_MAP.get(model_name, model_name)
-        cmd.extend(["--model", resolved])
+        # A "provider/" prefix (e.g. "qwen/<id>") is a bernstein-side routing
+        # label, not part of the real model id. The CLI passes --model's value
+        # through verbatim as the request's "model" field on the OpenAI-
+        # compatible auth path -- a prefixed value 404s against a backend
+        # that only knows the bare id (confirmed: --model qwen/<id> 404s,
+        # --model <id> succeeds against the same endpoint).
+        cmd.extend(["--model", resolved.split("/", 1)[-1]])
 
         # ``--auth-type openai`` tells the CLI to use the OpenAI-compatible key and
         # base URL from the environment instead of its own login. Every named
@@ -196,11 +202,25 @@ class QwenAdapter(CLIAdapter):
         provider = self._detect_provider(settings)
         api_key, base_url = self._resolve_provider_config(provider, settings)
 
-        env = build_filtered_env(["OPENAI_API_KEY", "OPENAI_BASE_URL", "TAVILY_API_KEY"])
+        env = build_filtered_env(["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL", "TAVILY_API_KEY"])
         if api_key:
             env["OPENAI_API_KEY"] = api_key
         if base_url:
             env["OPENAI_BASE_URL"] = base_url
+        # qwen-code's env-based OpenAI auth path only activates when
+        # OPENAI_API_KEY + OPENAI_MODEL + OPENAI_BASE_URL are ALL set
+        # (chunk-KCO4FLFJ.js: `env.OPENAI_API_KEY && (env.OPENAI_MODEL ||
+        # env.QWEN_MODEL) && env.OPENAI_BASE_URL`). --model/--auth-type openai
+        # on argv are not enough on their own -- without OPENAI_MODEL in the
+        # env, the CLI silently falls through to ~/.qwen/settings.json's
+        # configured provider instead of erroring, which can point at a
+        # different (possibly dead) backend. Use the same model-name
+        # resolution _build_command uses so the env and argv agree.
+        if base_url:
+            resolved_model = self._MODEL_MAP.get(model_config.model, model_config.model)
+            # Same prefix strip as the --model flag above (see _build_command)
+            # so the env-based auth path and the request's model field agree.
+            env["OPENAI_MODEL"] = resolved_model.split("/", 1)[-1]
         # Forward the Tavily key via env (never argv) so it does not appear
         # in ``ps``/audit logs on shared hosts. Qwen Code reads
         # ``TAVILY_API_KEY`` from the environment when the web_search tool
